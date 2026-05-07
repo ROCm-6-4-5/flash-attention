@@ -1,8 +1,48 @@
 import torch
 import torch.nn as nn
+import warnings
 
-import flash_attn_2_cuda as flash_attn_cuda
+# Try to import the C++/HIP extension first; fall back to Triton AMD backend on ROCm
+try:
+    import flash_attn_2_cuda as flash_attn_cuda
+    _USE_TRITON_ROCM = False
+except ImportError:
+    if getattr(torch.version, 'hip', None) is not None:
+        warnings.warn(
+            "flash_attn_2_cuda (ROCm/HIP kernels) not found, falling back to AMD Triton implementation. "
+            "Performance may be reduced compared to the native kernels.",
+            RuntimeWarning,
+        )
+        _USE_TRITON_ROCM = True
+        from flash_attn.flash_attn_triton_amd import interface_v2 as flash_attn_cuda
+    else:
+        raise
+
 from einops import rearrange
+
+
+def _triton_fwd_adapter(q, k, v, out, alibi_slopes, dropout_p, softmax_scale, causal,
+                        window_size_left=-1, window_size_right=-1, softcap=0.0, return_softmax=False):
+    """Adapter: Triton AMD fwd -> same return tuple as C++ fwd."""
+    out, softmax_lse, sd_mask, rng_state = flash_attn_cuda.fwd(
+        q, k, v, out, alibi_slopes, dropout_p, softmax_scale, causal,
+        window_size_left, window_size_right, softcap, return_softmax,
+    )
+    # C++ backend returns: out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+    return out, q, k, v, out, softmax_lse, sd_mask, rng_state
+
+
+def _triton_varlen_fwd_adapter(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                               alibi_slopes, dropout_p, softmax_scale, causal,
+                               window_size_left=-1, window_size_right=-1, softcap=0.0,
+                               return_softmax=False):
+    """Adapter: Triton AMD varlen_fwd -> same return tuple as C++ varlen_fwd."""
+    out, softmax_lse, sd_mask, rng_state = flash_attn_cuda.varlen_fwd(
+        q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        alibi_slopes, dropout_p, softmax_scale, causal,
+        window_size_left, window_size_right, softcap, return_softmax,
+    )
+    return out, q, k, v, out, softmax_lse, sd_mask, rng_state
 
 
 def _get_block_size(device, head_dim, is_dropout, is_causal):
@@ -39,6 +79,8 @@ def _get_block_size(device, head_dim, is_dropout, is_causal):
 def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal, return_softmax):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if _USE_TRITON_ROCM:
+        return _triton_fwd_adapter(q, k, v, None, None, dropout_p, softmax_scale, causal)
     out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
         q, k, v, None, dropout_p, softmax_scale, causal, return_softmax, None
     )
@@ -49,12 +91,15 @@ def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
                                dropout_p, softmax_scale, causal, return_softmax):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if _USE_TRITON_ROCM:
+        return _triton_varlen_fwd_adapter(
+            q, k, v, None, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            None, dropout_p, softmax_scale, causal,
+        )
     out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.varlen_fwd(
         q, k, v, None, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
         softmax_scale, False, causal, return_softmax, None
     )
-    # if out.isnan().any() or softmax_lse.isnan().any():
-    #     breakpoint()
     return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
 
 
@@ -63,6 +108,11 @@ def _flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if _USE_TRITON_ROCM:
+        return flash_attn_cuda.bwd(
+            dout, q, k, v, out, softmax_lse, dq, dk, dv, None,
+            dropout_p, softmax_scale, causal, -1, -1, 0.0, False, None, rng_state,
+        )
     dq, dk, dv, softmax_d, = flash_attn_cuda.bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, dropout_p,
         softmax_scale, causal, None, rng_state
@@ -76,12 +126,16 @@ def _flash_attn_varlen_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if _USE_TRITON_ROCM:
+        return flash_attn_cuda.varlen_bwd(
+            dout, q, k, v, out, softmax_lse, dq, dk, dv,
+            cu_seqlens_q, cu_seqlens_k, None, max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale, False, causal, -1, -1, 0.0, False, None, rng_state,
+        )
     dq, dk, dv, softmax_d, = flash_attn_cuda.varlen_bwd(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, dropout_p, softmax_scale, False, causal, None, rng_state
     )
-    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
-    #     breakpoint()
     return dq, dk, dv, softmax_d
 
 
